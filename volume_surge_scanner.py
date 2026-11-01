@@ -22,6 +22,10 @@ Options:
     --no-clear                     don't clear the terminal between scans (for log files / CI)
     --telegram                     send new surges to Telegram; needs env vars
                                    TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID
+    --source auto|nse|yahoo        live-quote source. auto (default) tries NSE's site and
+                                   falls back to Yahoo Finance if NSE refuses (datacenter
+                                   IPs such as GitHub runners). Yahoo quotes may lag a
+                                   few minutes; NSE's are live.
 
 Outputs:
     terminal table every minute
@@ -37,10 +41,11 @@ import json
 import os
 import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor
 import time
 import zipfile
 from http.server import HTTPServer, SimpleHTTPRequestHandler
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import pandas as pd
 import requests
@@ -70,7 +75,7 @@ PROFILE = [(0, 0.0), (15, 0.068), (30, 0.12), (45, 0.165), (60, 0.207), (75, 0.2
 
 
 def now_ist():
-    return datetime.utcnow() + IST_OFFSET
+    return datetime.now(timezone.utc).replace(tzinfo=None) + IST_OFFSET
 
 
 def minutes_since_open(t):
@@ -153,6 +158,108 @@ class NSE:
         return None
 
 
+
+# ----------------------------------------------------------------------------
+# Yahoo Finance fallback for live quotes (used when NSE's live API is blocked)
+# ----------------------------------------------------------------------------
+INDEX_LIST_FILES = {
+    "NIFTY 500": "ind_nifty500list.csv", "NIFTY 50": "ind_nifty50list.csv",
+    "NIFTY 200": "ind_nifty200list.csv", "NIFTY MIDCAP 150": "ind_niftymidcap150list.csv",
+    "NIFTY TOTAL MARKET": "ind_niftytotalmarket_list.csv",
+}
+
+
+def index_symbols(nse, index):
+    """Constituents of an NSE index: from NSE's archive, else a local <index>.csv (Symbol column)."""
+    fn = INDEX_LIST_FILES.get(index.upper())
+    if fn:
+        for host in ("https://nsearchives.nseindia.com", "https://archives.nseindia.com"):
+            try:
+                r = nse.s.get(f"{host}/content/indices/{fn}", timeout=20)
+                if r.status_code == 200 and "Symbol" in r.text[:500]:
+                    return pd.read_csv(io.StringIO(r.text))["Symbol"].str.strip().tolist()
+            except requests.RequestException:
+                pass
+    local = index.lower().replace(" ", "") + ".csv"
+    if os.path.exists(local):
+        return pd.read_csv(local)["Symbol"].str.strip().tolist()
+    raise RuntimeError(f"No constituent list for {index}: NSE archive unreachable and {local} not found")
+
+
+class YahooLive:
+    """Same live_index() contract as NSE, built on Yahoo's batch quote endpoint."""
+
+    def __init__(self, symbols):
+        self.symbols = symbols
+        self.s = requests.Session()
+        self.s.headers.update({"User-Agent": HEADERS["User-Agent"], "Accept": "application/json"})
+        self.crumb = None
+        self._auth()
+
+    def _auth(self):
+        try:
+            self.s.get("https://fc.yahoo.com", timeout=10)  # sets cookies (404 is expected)
+            r = self.s.get("https://query1.finance.yahoo.com/v1/test/getcrumb", timeout=10)
+            self.crumb = r.text.strip() if r.status_code == 200 and r.text and "<" not in r.text else None
+        except requests.RequestException:
+            self.crumb = None
+
+    def live_index(self, index):
+        rows = self._quote_batch() if self.crumb else None
+        if not rows:
+            rows = self._chart_all()
+        if not rows:
+            raise RuntimeError("Yahoo returned no quotes")
+        return pd.DataFrame(rows).set_index("symbol")
+
+    def _quote_batch(self):
+        """v7 batch quote: 100 symbols per request. Needs the crumb cookie."""
+        rows = []
+        for i in range(0, len(self.symbols), 100):
+            batch = self.symbols[i:i + 100]
+            params = {"symbols": ",".join(s + ".NS" for s in batch), "crumb": self.crumb,
+                      "fields": "regularMarketPrice,regularMarketChangePercent,regularMarketVolume"}
+            try:
+                r = self.s.get("https://query1.finance.yahoo.com/v7/finance/quote", params=params, timeout=15)
+                if r.status_code != 200:
+                    if r.status_code in (401, 403):
+                        self.crumb = None
+                    return None
+                for q in r.json()["quoteResponse"]["result"]:
+                    rows.append({"symbol": q.get("symbol", "").removesuffix(".NS"), "ltp": q.get("regularMarketPrice"),
+                                 "pchg": q.get("regularMarketChangePercent"), "cum_vol": q.get("regularMarketVolume") or 0})
+            except (requests.RequestException, ValueError, KeyError):
+                return None
+        return rows
+
+    def _chart_one(self, sym):
+        url = "https://query1.finance.yahoo.com/v8/finance/chart/" + requests.utils.quote(sym + ".NS", safe="")
+        for attempt in range(2):
+            try:
+                r = self.s.get(url, params={"range": "1d", "interval": "1d"}, timeout=10)
+                if r.status_code == 200:
+                    m = r.json()["chart"]["result"][0]["meta"]
+                    px, prev = m.get("regularMarketPrice"), m.get("chartPreviousClose")
+                    pchg = (px / prev - 1) * 100 if px and prev else None
+                    return {"symbol": sym, "ltp": px, "pchg": pchg, "cum_vol": m.get("regularMarketVolume") or 0}
+                if r.status_code == 429:
+                    time.sleep(2 + attempt * 3)
+                else:
+                    return None
+            except (requests.RequestException, ValueError, KeyError, IndexError, TypeError):
+                time.sleep(1)
+        return None
+
+    def _chart_all(self):
+        """Per-symbol chart endpoint (no crumb needed), ~15 s for 500 symbols with a thread pool."""
+        with ThreadPoolExecutor(max_workers=12) as ex:
+            out = list(ex.map(self._chart_one, self.symbols))
+        rows = [o for o in out if o]
+        missing = len(out) - len(rows)
+        if missing:
+            print(f"[yahoo] {missing} symbols returned no quote this minute")
+        return rows
+
 # ----------------------------------------------------------------------------
 # Baseline volume
 # ----------------------------------------------------------------------------
@@ -192,6 +299,10 @@ class Scanner:
         self.args = args
         self.nse = NSE()
         self.avg = load_baseline(self.nse, args.lookback)
+        self.live = self.nse
+        self.source = "nse"
+        if args.source == "yahoo":
+            self.use_yahoo("requested")
         self.history = []  # list of (minute, cum_vol Series)
         today = now_ist().date()
         self.alerts_file = f"alerts_{today}.csv"
@@ -205,6 +316,14 @@ class Scanner:
                 args.telegram = False
             else:
                 self.telegram(f"Volume surge scanner started ({args.index}, {today})")
+
+    def use_yahoo(self, why):
+        syms = [s for s in index_symbols(self.nse, self.args.index) if s in self.avg.index]
+        self.live = YahooLive(syms)
+        self.source = "yahoo"
+        print(f"[source] switched to Yahoo Finance quotes ({len(syms)} symbols): {why}")
+        if self.args.telegram:
+            self.telegram(f"Live source: Yahoo Finance ({why}); quotes may lag a few minutes.")
 
     def telegram(self, text):
         try:
@@ -229,7 +348,14 @@ class Scanner:
     def scan(self):
         t = now_ist()
         mins = minutes_since_open(t)
-        live = self.nse.live_index(self.args.index)
+        try:
+            live = self.live.live_index(self.args.index)
+        except RuntimeError as e:
+            if self.source == "nse" and self.args.source == "auto":
+                self.use_yahoo(f"NSE live API refused: {e}")
+                live = self.live.live_index(self.args.index)
+            else:
+                raise
         live = live.join(self.avg.rename("avg_vol"), how="left").dropna(subset=["avg_vol"])
         live = live[live["avg_vol"] > 0]
 
@@ -273,7 +399,7 @@ class Scanner:
     def show(self, t, mins, flagged, n):
         if not self.args.no_clear:
             os.system("cls" if os.name == "nt" else "clear")
-        print(f"NSE VOLUME SURGE  {t:%Y-%m-%d %H:%M} IST   universe={self.args.index} ({n} stocks)   "
+        print(f"NSE VOLUME SURGE  {t:%Y-%m-%d %H:%M} IST   universe={self.args.index} ({n} stocks, via {self.source})   "
               f"expected {expected_fraction(mins):.0%} of day traded by now")
         print(f"flag if RVOL >= {self.args.rvol}x  or  5-min spike >= {self.args.spike}x\n")
         if flagged.empty:
@@ -354,6 +480,7 @@ def main():
     p.add_argument("--until", default=f"{SCAN_END[0]:02d}:{SCAN_END[1]:02d}")
     p.add_argument("--no-clear", action="store_true")
     p.add_argument("--telegram", action="store_true")
+    p.add_argument("--source", choices=["auto", "nse", "yahoo"], default="auto")
     args = p.parse_args()
 
     if args.web:
