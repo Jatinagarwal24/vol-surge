@@ -1,0 +1,42 @@
+name: NSE volume surge scan
+
+on:
+  schedule:
+    # GitHub cron is UTC. 03:35 UTC = 09:05 IST, 07:00 UTC = 12:30 IST. Mon–Fri.
+    # Starts are best-effort and often 5–25 min late; the script waits for 09:15 itself.
+    - cron: "35 3 * * 1-5"
+    - cron: "0 7 * * 1-5"
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests pandas
+
+      - name: Pick session window
+        id: win
+        run: |
+          H=$(TZ=Asia/Kolkata date +%H)
+          if [ "$H" -lt 12 ]; then echo "until=12:30" >> "$GITHUB_OUTPUT"; else echo "until=15:30" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Run scanner
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python volume_surge_scanner.py --no-clear --telegram --until ${{ steps.win.outputs.until }}
+
+      - name: Upload alerts and snapshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-${{ github.run_id }}
+          path: |
+            alerts_*.csv
+            snapshots_*.csv
+          if-no-files-found: ignore
