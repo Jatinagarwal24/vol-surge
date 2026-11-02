@@ -11,8 +11,10 @@ Run on your own machine:
 Options:
     --index "NIFTY 500"            universe (default). Others: "NIFTY TOTAL MARKET",
                                    "SECURITIES IN F&O", "NIFTY 200", "NIFTY MIDCAP 150"
-    --rvol 2.0                     flag if today's cum. volume >= 2x expected-by-now
-    --spike 3.0                    flag if last-5-min volume >= 3x expected 5-min volume
+    --rvol 3.0                     volume condition: today's cum. volume >= 3x expected-by-now
+    --spike 4.0                    or last-5-min volume >= 4x expected 5-min pace (after 10:00)
+    --min-move 0                   optional price filter: |change vs prev close| >= N%.
+                                   Default 0 = volume only, price not considered.
     --lookback 20                  days of history for "normal" volume
     --once                         run a single scan and exit (for testing)
     --web                          also serve a live dashboard at http://localhost:8765
@@ -337,12 +339,13 @@ class Scanner:
         self.seen.update(new.index)
         if new.empty:
             return
+        new = new.sort_values("rvol", ascending=False)
         lines = [f"<b>{t:%H:%M}</b> — {len(new)} new surge{'s' if len(new) > 1 else ''}"]
-        for sym, r in new.head(25).iterrows():
+        for sym, r in new.head(15).iterrows():
             spk = "" if pd.isna(r["spike"]) else f" · 5m {r['spike']:.1f}x"
             lines.append(f"<b>{sym}</b> {r['pchg']:+.1f}% · RVOL {r['rvol']:.1f}x{spk} · ₹{r['ltp']}")
-        if len(new) > 25:
-            lines.append(f"…and {len(new) - 25} more")
+        if len(new) > 15:
+            lines.append(f"…and {len(new) - 15} more")
         self.telegram("\n".join(lines))
 
     def scan(self):
@@ -366,7 +369,8 @@ class Scanner:
         # last-5-minute spike
         self.history.append((mins, live["cum_vol"].copy()))
         self.history = [h for h in self.history if mins - h[0] <= 30]
-        prior = [h for h in self.history if mins - h[0] >= 5]
+        # skip the first 45 min: the fitted per-minute pace is tiny early, so ratios explode
+        prior = [h for h in self.history if mins - h[0] >= 5] if mins >= 45 else []
         if prior:
             m_prev, cum_prev = prior[-1]
             window = mins - m_prev
@@ -383,7 +387,9 @@ class Scanner:
         snap.index = [t.strftime("%H:%M")]
         snap.to_csv(self.snap_file, mode="a", header=not os.path.exists(self.snap_file))
 
-        flagged = live[(live["rvol"] >= self.args.rvol) | (live["spike"] >= self.args.spike)]
+        vol_ok = (live["rvol"] >= self.args.rvol) | (live["spike"] >= self.args.spike)
+        move_ok = live["pchg"].abs() >= self.args.min_move
+        flagged = live[vol_ok & move_ok]
         flagged = flagged.sort_values("rvol", ascending=False)
         self.show(t, mins, flagged, len(live))
         if self.args.web:
@@ -401,7 +407,8 @@ class Scanner:
             os.system("cls" if os.name == "nt" else "clear")
         print(f"NSE VOLUME SURGE  {t:%Y-%m-%d %H:%M} IST   universe={self.args.index} ({n} stocks, via {self.source})   "
               f"expected {expected_fraction(mins):.0%} of day traded by now")
-        print(f"flag if RVOL >= {self.args.rvol}x  or  5-min spike >= {self.args.spike}x\n")
+        mv = f"  and  |move| >= {self.args.min_move}%" if self.args.min_move > 0 else ""
+        print(f"flag if RVOL >= {self.args.rvol}x or 5-min spike >= {self.args.spike}x{mv}\n")
         if flagged.empty:
             print("  no surges this minute")
             return
@@ -443,7 +450,7 @@ th{{color:#8b93a1;font-weight:500;font-size:12px;text-transform:uppercase}} td.s
 <h1>NSE Volume Surge</h1>
 <div class=meta>{t:%d %b %Y %H:%M} IST &middot; {html.escape(self.args.index)} ({n} stocks) &middot;
 {expected_fraction(mins):.0%} of a normal day's volume expected by now &middot;
-flag: RVOL &ge; {self.args.rvol}x or 5-min spike &ge; {self.args.spike}x &middot; {len(flagged)} flagged</div>
+flag: RVOL &ge; {self.args.rvol}x or 5-min spike &ge; {self.args.spike}x{(' and |move| &ge; %g%%' % self.args.min_move) if self.args.min_move > 0 else ''} &middot; {len(flagged)} flagged</div>
 <table><tr><th class=sym>Symbol</th><th>LTP</th><th>Chg</th><th>Vol today</th><th>Avg day</th><th>RVOL</th><th>5-min</th></tr>
 {body}</table></body></html>"""
         with open("dashboard.html", "w", encoding="utf-8") as f:
@@ -472,8 +479,9 @@ def start_web(port=8765):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--index", default="NIFTY 500")
-    p.add_argument("--rvol", type=float, default=2.0)
-    p.add_argument("--spike", type=float, default=3.0)
+    p.add_argument("--rvol", type=float, default=3.0)
+    p.add_argument("--spike", type=float, default=4.0)
+    p.add_argument("--min-move", type=float, default=0.0)
     p.add_argument("--lookback", type=int, default=20)
     p.add_argument("--once", action="store_true")
     p.add_argument("--web", action="store_true")

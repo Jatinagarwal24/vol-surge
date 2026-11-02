@@ -2,37 +2,63 @@ name: NSE volume surge scan
 
 on:
   schedule:
-    # GitHub cron is UTC. 03:35 UTC = 09:05 IST, 07:00 UTC = 12:30 IST. Mon–Fri.
-    # Starts are best-effort and often 5–25 min late; the script waits for 09:15 itself.
-    - cron: "35 3 * * 1-5"
-    - cron: "0 7 * * 1-5"
+    # GitHub cron is UTC and best-effort (often late, sometimes skipped), so each
+    # session has several start attempts; the guard step below lets only one run.
+    # Morning session (scans 09:15–12:20 IST): 09:00, 09:10, 09:20, 09:35 IST
+    - cron: "30 3 * * 1-5"
+    - cron: "40 3 * * 1-5"
+    - cron: "50 3 * * 1-5"
+    - cron: "5 4 * * 1-5"
+    # Afternoon session (12:20–15:30 IST): 12:22, 12:32, 12:45, 13:00 IST
+    - cron: "52 6 * * 1-5"
+    - cron: "2 7 * * 1-5"
+    - cron: "15 7 * * 1-5"
+    - cron: "30 7 * * 1-5"
   workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
 
 jobs:
   scan:
     runs-on: ubuntu-latest
     timeout-minutes: 350
     steps:
+      - name: Skip if another scan is already running
+        id: guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          running=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow scan.yml --status in_progress --json databaseId --jq 'length')
+          H=$(TZ=Asia/Kolkata date +%H); M=$(TZ=Asia/Kolkata date +%M)
+          if [ "$running" -gt 1 ]; then
+            echo "another scan is running — skipping"; echo "go=false" >> "$GITHUB_OUTPUT"
+          elif [ "$H" -gt 15 ] || { [ "$H" -eq 15 ] && [ "$M" -ge 20 ]; }; then
+            echo "market closed — skipping"; echo "go=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "go=true" >> "$GITHUB_OUTPUT"
+            if [ "$H" -lt 12 ] || { [ "$H" -eq 12 ] && [ "$M" -lt 15 ]; }; then echo "until=12:20" >> "$GITHUB_OUTPUT"; else echo "until=15:30" >> "$GITHUB_OUTPUT"; fi
+          fi
+
       - uses: actions/checkout@v4
+        if: steps.guard.outputs.go == 'true'
       - uses: actions/setup-python@v5
+        if: steps.guard.outputs.go == 'true'
         with:
           python-version: "3.12"
-      - run: pip install requests pandas
-
-      - name: Pick session window
-        id: win
-        run: |
-          H=$(TZ=Asia/Kolkata date +%H)
-          if [ "$H" -lt 12 ]; then echo "until=12:30" >> "$GITHUB_OUTPUT"; else echo "until=15:30" >> "$GITHUB_OUTPUT"; fi
+      - if: steps.guard.outputs.go == 'true'
+        run: pip install requests pandas
 
       - name: Run scanner
+        if: steps.guard.outputs.go == 'true'
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python volume_surge_scanner.py --no-clear --telegram --until ${{ steps.win.outputs.until }}
+        run: python volume_surge_scanner.py --no-clear --telegram --until ${{ steps.guard.outputs.until }}
 
       - name: Upload alerts and snapshots
-        if: always()
+        if: always() && steps.guard.outputs.go == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: scan-${{ github.run_id }}
