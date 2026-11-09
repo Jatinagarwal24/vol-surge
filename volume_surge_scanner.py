@@ -12,7 +12,10 @@ Options:
     --index "NIFTY 500"            universe (default). Others: "NIFTY TOTAL MARKET",
                                    "SECURITIES IN F&O", "NIFTY 200", "NIFTY MIDCAP 150"
     --rvol 3.0                     volume condition: today's cum. volume >= 3x expected-by-now
-    --spike 4.0                    or last-5-min volume >= 4x expected 5-min pace (after 10:00)
+    --spike 5.0                    or last-15-min volume >= 5x the median of this stock's earlier
+                                   15-min windows today (needs >= 3 earlier windows, so from ~10:15)
+                                   AND the day's RVOL >= --spike-rvol (default 1.5): the stock
+                                   must already be busy, not just a lunchtime block trade
     --min-move 0                   optional price filter: |change vs prev close| >= N%.
                                    Default 0 = volume only, price not considered.
     --lookback 20                  days of history for "normal" volume
@@ -55,7 +58,8 @@ import requests
 IST_OFFSET = timedelta(hours=5, minutes=30)
 MARKET_OPEN = (9, 15)
 SCAN_END = (15, 30)
-MARKET_CLOSE_MIN = 375  # 09:15 -> 15:30
+MARKET_CLOSE_MIN = 375
+DAY_MINS = MARKET_CLOSE_MIN  # 09:15 -> 15:30
 
 HEADERS = {
     "User-Agent": (
@@ -305,7 +309,8 @@ class Scanner:
         self.source = "nse"
         if args.source == "yahoo":
             self.use_yahoo("requested")
-        self.history = []  # list of (minute, cum_vol Series)
+        self.history = []  # list of (minute, cum_vol Series), last ~4 hours
+        self.windows = []  # list of (end_minute, 15-min volume Series) for the spike baseline
         today = now_ist().date()
         self.alerts_file = f"alerts_{today}.csv"
         self.snap_file = f"snapshots_{today}.csv"
@@ -342,7 +347,7 @@ class Scanner:
         new = new.sort_values("rvol", ascending=False)
         lines = [f"<b>{t:%H:%M}</b> — {len(new)} new surge{'s' if len(new) > 1 else ''}"]
         for sym, r in new.head(15).iterrows():
-            spk = "" if pd.isna(r["spike"]) else f" · 5m {r['spike']:.1f}x"
+            spk = "" if pd.isna(r["spike"]) else f" · 15m {r['spike']:.1f}x"
             lines.append(f"<b>{sym}</b> {r['pchg']:+.1f}% · RVOL {r['rvol']:.1f}x{spk} · ₹{r['ltp']}")
         if len(new) > 15:
             lines.append(f"…and {len(new) - 15} more")
@@ -366,28 +371,36 @@ class Scanner:
         live["expected_cum"] = live["avg_vol"] * frac_now
         live["rvol"] = live["cum_vol"] / live["expected_cum"].clip(lower=1)
 
-        # last-5-minute spike
+        # 15-minute spike: last 15 min of volume vs the median of this stock's own earlier
+        # 15-min windows today (what the eye sees on a 15m chart: "this bar is 6x its neighbours")
         self.history.append((mins, live["cum_vol"].copy()))
-        self.history = [h for h in self.history if mins - h[0] <= 30]
-        # skip the first 45 min: the fitted per-minute pace is tiny early, so ratios explode
-        prior = [h for h in self.history if mins - h[0] >= 5] if mins >= 45 else []
+        self.history = [h for h in self.history if mins - h[0] <= 240]
+        live["vol_15m"] = float("nan")
+        live["spike"] = float("nan")
+        prior = [h for h in self.history if mins - h[0] >= 15]
         if prior:
             m_prev, cum_prev = prior[-1]
-            window = mins - m_prev
-            delta = (live["cum_vol"] - cum_prev.reindex(live.index).fillna(0)).clip(lower=0)
-            exp_window = live["avg_vol"] * (expected_fraction(mins) - expected_fraction(m_prev))
-            live["vol_5m"] = delta
-            live["spike"] = delta / exp_window.clip(lower=1)
-        else:
-            live["vol_5m"] = float("nan")
-            live["spike"] = float("nan")
+            last15 = (live["cum_vol"] - cum_prev.reindex(live.index).fillna(0)).clip(lower=0)
+            last15 = last15 * (15 / max(mins - m_prev, 1))  # normalise if the gap isn't exactly 15
+            live["vol_15m"] = last15
+            # record one completed, non-overlapping window every 15 minutes (ignore the opening 15)
+            if m_prev >= 15 and (not self.windows or mins - self.windows[-1][0] >= 15):
+                self.windows.append((mins, last15.copy()))
+                self.windows = self.windows[-24:]
+            earlier = [w for w in self.windows if w[0] <= mins - 15]
+            if len(earlier) >= 3:
+                base = pd.concat([w[1] for w in earlier], axis=1).median(axis=1)
+                base = base.reindex(live.index)
+                floor = live["avg_vol"] / DAY_MINS * 15 * 0.25  # avoid div-by-tiny on illiquid names
+                live["spike"] = last15 / base.clip(lower=floor.clip(lower=1))
 
         # snapshot log (for later calibration of PROFILE)
         snap = live[["cum_vol"]].T
         snap.index = [t.strftime("%H:%M")]
         snap.to_csv(self.snap_file, mode="a", header=not os.path.exists(self.snap_file))
 
-        vol_ok = (live["rvol"] >= self.args.rvol) | (live["spike"] >= self.args.spike)
+        spike_ok = (live["spike"] >= self.args.spike) & (live["rvol"] >= self.args.spike_rvol)
+        vol_ok = (live["rvol"] >= self.args.rvol) | spike_ok
         move_ok = live["pchg"].abs() >= self.args.min_move
         flagged = live[vol_ok & move_ok]
         flagged = flagged.sort_values("rvol", ascending=False)
@@ -408,19 +421,19 @@ class Scanner:
         print(f"NSE VOLUME SURGE  {t:%Y-%m-%d %H:%M} IST   universe={self.args.index} ({n} stocks, via {self.source})   "
               f"expected {expected_fraction(mins):.0%} of day traded by now")
         mv = f"  and  |move| >= {self.args.min_move}%" if self.args.min_move > 0 else ""
-        print(f"flag if RVOL >= {self.args.rvol}x or 5-min spike >= {self.args.spike}x{mv}\n")
+        print(f"flag if RVOL >= {self.args.rvol}x  or  (15-min spike >= {self.args.spike}x and RVOL >= {self.args.spike_rvol}x){mv}\n")
         if flagged.empty:
             print("  no surges this minute")
             return
-        cols = ["ltp", "pchg", "cum_vol", "avg_vol", "rvol", "vol_5m", "spike"]
+        cols = ["ltp", "pchg", "cum_vol", "avg_vol", "rvol", "vol_15m", "spike"]
         fmt = flagged[cols].copy()
         fmt["cum_vol"] = fmt["cum_vol"].map(lambda x: f"{x/1e5:.1f}L")
         fmt["avg_vol"] = fmt["avg_vol"].map(lambda x: f"{x/1e5:.1f}L")
-        fmt["vol_5m"] = fmt["vol_5m"].map(lambda x: "-" if pd.isna(x) else f"{x/1e5:.1f}L")
+        fmt["vol_15m"] = fmt["vol_15m"].map(lambda x: "-" if pd.isna(x) else f"{x/1e5:.1f}L")
         fmt["rvol"] = fmt["rvol"].map(lambda x: f"{x:.1f}x")
         fmt["spike"] = fmt["spike"].map(lambda x: "-" if pd.isna(x) else f"{x:.1f}x")
         fmt["pchg"] = fmt["pchg"].map(lambda x: f"{x:+.2f}%")
-        fmt.columns = ["LTP", "Chg", "Vol today", "Avg day", "RVOL", "Vol 5m", "Spike"]
+        fmt.columns = ["LTP", "Chg", "Vol today", "Avg day", "RVOL", "Vol 15m", "Spike"]
         print(fmt.head(40).to_string())
         if len(flagged) > 40:
             print(f"  ... and {len(flagged) - 40} more (see {self.alerts_file})")
@@ -450,8 +463,8 @@ th{{color:#8b93a1;font-weight:500;font-size:12px;text-transform:uppercase}} td.s
 <h1>NSE Volume Surge</h1>
 <div class=meta>{t:%d %b %Y %H:%M} IST &middot; {html.escape(self.args.index)} ({n} stocks) &middot;
 {expected_fraction(mins):.0%} of a normal day's volume expected by now &middot;
-flag: RVOL &ge; {self.args.rvol}x or 5-min spike &ge; {self.args.spike}x{(' and |move| &ge; %g%%' % self.args.min_move) if self.args.min_move > 0 else ''} &middot; {len(flagged)} flagged</div>
-<table><tr><th class=sym>Symbol</th><th>LTP</th><th>Chg</th><th>Vol today</th><th>Avg day</th><th>RVOL</th><th>5-min</th></tr>
+flag: RVOL &ge; {self.args.rvol}x or (15-min spike &ge; {self.args.spike}x and RVOL &ge; {self.args.spike_rvol}x){(' and |move| &ge; %g%%' % self.args.min_move) if self.args.min_move > 0 else ''} &middot; {len(flagged)} flagged</div>
+<table><tr><th class=sym>Symbol</th><th>LTP</th><th>Chg</th><th>Vol today</th><th>Avg day</th><th>RVOL</th><th>15-min</th></tr>
 {body}</table></body></html>"""
         with open("dashboard.html", "w", encoding="utf-8") as f:
             f.write(page)
@@ -480,7 +493,8 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--index", default="NIFTY 500")
     p.add_argument("--rvol", type=float, default=3.0)
-    p.add_argument("--spike", type=float, default=4.0)
+    p.add_argument("--spike", type=float, default=5.0)
+    p.add_argument("--spike-rvol", type=float, default=1.5)
     p.add_argument("--min-move", type=float, default=0.0)
     p.add_argument("--lookback", type=int, default=20)
     p.add_argument("--once", action="store_true")
