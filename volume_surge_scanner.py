@@ -13,9 +13,15 @@ Options:
                                    "SECURITIES IN F&O", "NIFTY 200", "NIFTY MIDCAP 150"
     --rvol 3.0                     volume condition: today's cum. volume >= 3x expected-by-now
     --spike 5.0                    or last-15-min volume >= 5x the median of this stock's earlier
-                                   15-min windows today (needs >= 3 earlier windows, so from ~10:15)
-                                   AND the day's RVOL >= --spike-rvol (default 1.5): the stock
-                                   must already be busy, not just a lunchtime block trade
+                                   15-min windows today, with the day's RVOL >= --spike-rvol (1.5)
+                                   and the 15-min candle >= --candle (1%)
+    --fast 8.0                     or FAST: last-5-min volume >= 8x the median 5-min bar today,
+                                   >= 2% of a normal day's volume, and the 5-min candle >= --candle.
+                                   Catches a burst within minutes instead of waiting 15.
+    --candle 1.0                   candle size (%) the spike/fast volume must come with. Block
+                                   deals print huge volume with no candle; this is what tells a
+                                   momentum burst from a block deal. Applies to spike and fast
+                                   triggers only; the RVOL trigger stays volume-only.
     --min-move 0                   optional price filter: |change vs prev close| >= N%.
                                    Default 0 = volume only, price not considered.
     --lookback 20                  days of history for "normal" volume
@@ -52,6 +58,7 @@ import zipfile
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from datetime import date, datetime, timedelta, timezone
 
+import numpy as np
 import pandas as pd
 import requests
 
@@ -309,8 +316,9 @@ class Scanner:
         self.source = "nse"
         if args.source == "yahoo":
             self.use_yahoo("requested")
-        self.history = []  # list of (minute, cum_vol Series), last ~4 hours
-        self.windows = []  # list of (end_minute, 15-min volume Series) for the spike baseline
+        self.history = []  # list of (minute, cum_vol Series, ltp Series), last ~4 hours
+        self.windows = []  # (end_minute, 15-min volume Series): spike baseline
+        self.bars5 = []    # (end_minute, 5-min volume Series): fast-trigger baseline
         today = now_ist().date()
         self.alerts_file = f"alerts_{today}.csv"
         self.snap_file = f"snapshots_{today}.csv"
@@ -347,8 +355,13 @@ class Scanner:
         new = new.sort_values("rvol", ascending=False)
         lines = [f"<b>{t:%H:%M}</b> — {len(new)} new surge{'s' if len(new) > 1 else ''}"]
         for sym, r in new.head(15).iterrows():
-            spk = "" if pd.isna(r["spike"]) else f" · 15m {r['spike']:.1f}x"
-            lines.append(f"<b>{sym}</b> {r['pchg']:+.1f}% · RVOL {r['rvol']:.1f}x{spk} · ₹{r['ltp']}")
+            if r["why"] == "FAST":
+                why = f" · ⚡5m {r['fast']:.0f}x ({r['move_5m']:+.1f}%)"
+            elif r["why"] == "15m":
+                why = f" · 15m {r['spike']:.0f}x ({r['move_15m']:+.1f}%)"
+            else:
+                why = "" if pd.isna(r["spike"]) else f" · 15m {r['spike']:.1f}x"
+            lines.append(f"<b>{sym}</b> {r['pchg']:+.1f}% · RVOL {r['rvol']:.1f}x{why} · ₹{r['ltp']}")
         if len(new) > 15:
             lines.append(f"…and {len(new) - 15} more")
         self.telegram("\n".join(lines))
@@ -373,16 +386,21 @@ class Scanner:
 
         # 15-minute spike: last 15 min of volume vs the median of this stock's own earlier
         # 15-min windows today (what the eye sees on a 15m chart: "this bar is 6x its neighbours")
-        self.history.append((mins, live["cum_vol"].copy()))
+        self.history.append((mins, live["cum_vol"].copy(), live["ltp"].copy()))
         self.history = [h for h in self.history if mins - h[0] <= 240]
         live["vol_15m"] = float("nan")
         live["spike"] = float("nan")
+        live["move_15m"] = float("nan")
+        live["vol_5m"] = float("nan")
+        live["fast"] = float("nan")
+        live["move_5m"] = float("nan")
         prior = [h for h in self.history if mins - h[0] >= 15]
         if prior:
-            m_prev, cum_prev = prior[-1]
+            m_prev, cum_prev, ltp_prev = prior[-1]
             last15 = (live["cum_vol"] - cum_prev.reindex(live.index).fillna(0)).clip(lower=0)
             last15 = last15 * (15 / max(mins - m_prev, 1))  # normalise if the gap isn't exactly 15
             live["vol_15m"] = last15
+            live["move_15m"] = (live["ltp"] / ltp_prev.reindex(live.index) - 1) * 100
             # record one completed, non-overlapping window every 15 minutes (ignore the opening 15)
             if m_prev >= 15 and (not self.windows or mins - self.windows[-1][0] >= 15):
                 self.windows.append((mins, last15.copy()))
@@ -393,17 +411,36 @@ class Scanner:
                 base = base.reindex(live.index)
                 floor = live["avg_vol"] / DAY_MINS * 15 * 0.25  # avoid div-by-tiny on illiquid names
                 live["spike"] = last15 / base.clip(lower=floor.clip(lower=1))
+        # FAST trigger: last 5 minutes vs this stock's median 5-min bar today
+        prior5 = [h for h in self.history if mins - h[0] >= 5]
+        if prior5:
+            m5, cum5, ltp5 = prior5[-1]
+            last5 = (live["cum_vol"] - cum5.reindex(live.index).fillna(0)).clip(lower=0) * (5 / max(mins - m5, 1))
+            live["vol_5m"] = last5
+            live["move_5m"] = (live["ltp"] / ltp5.reindex(live.index) - 1) * 100
+            if m5 >= 15 and (not self.bars5 or mins - self.bars5[-1][0] >= 5):
+                self.bars5.append((mins, last5.copy()))
+                self.bars5 = self.bars5[-72:]
+            earlier5 = [b for b in self.bars5 if b[0] <= mins - 5]
+            if len(earlier5) >= 6:
+                med5 = pd.concat([b[1] for b in earlier5], axis=1).median(axis=1).reindex(live.index)
+                floor5 = live["avg_vol"] / DAY_MINS * 5 * 0.25
+                live["fast"] = last5 / med5.clip(lower=floor5.clip(lower=1))
 
         # snapshot log (for later calibration of PROFILE)
         snap = live[["cum_vol"]].T
         snap.index = [t.strftime("%H:%M")]
         snap.to_csv(self.snap_file, mode="a", header=not os.path.exists(self.snap_file))
 
-        spike_ok = (live["spike"] >= self.args.spike) & (live["rvol"] >= self.args.spike_rvol)
-        vol_ok = (live["rvol"] >= self.args.rvol) | spike_ok
+        spike_ok = ((live["spike"] >= self.args.spike) & (live["rvol"] >= self.args.spike_rvol)
+                    & (live["move_15m"].abs() >= self.args.candle))
+        fast_ok = ((live["fast"] >= self.args.fast) & (live["vol_5m"] >= 0.02 * live["avg_vol"])
+                   & (live["move_5m"].abs() >= self.args.candle))
+        live["why"] = np.select([live["rvol"] >= self.args.rvol, fast_ok, spike_ok], ["RVOL", "FAST", "15m"], "")
+        vol_ok = (live["rvol"] >= self.args.rvol) | spike_ok | fast_ok
         move_ok = live["pchg"].abs() >= self.args.min_move
         flagged = live[vol_ok & move_ok]
-        flagged = flagged.sort_values("rvol", ascending=False)
+        flagged = flagged.assign(_k=flagged["fast"].fillna(0).clip(upper=100) + flagged["rvol"]).sort_values("_k", ascending=False).drop(columns="_k")
         self.show(t, mins, flagged, len(live))
         if self.args.web:
             self.write_html(t, mins, flagged, len(live))
@@ -421,19 +458,22 @@ class Scanner:
         print(f"NSE VOLUME SURGE  {t:%Y-%m-%d %H:%M} IST   universe={self.args.index} ({n} stocks, via {self.source})   "
               f"expected {expected_fraction(mins):.0%} of day traded by now")
         mv = f"  and  |move| >= {self.args.min_move}%" if self.args.min_move > 0 else ""
-        print(f"flag if RVOL >= {self.args.rvol}x  or  (15-min spike >= {self.args.spike}x and RVOL >= {self.args.spike_rvol}x){mv}\n")
+        print(f"flag if RVOL >= {self.args.rvol}x  or  15m spike >= {self.args.spike}x (RVOL >= {self.args.spike_rvol}x)  "
+              f"or  FAST 5m >= {self.args.fast}x; spike/fast need a >= {self.args.candle}% candle{mv}\n")
         if flagged.empty:
             print("  no surges this minute")
             return
-        cols = ["ltp", "pchg", "cum_vol", "avg_vol", "rvol", "vol_15m", "spike"]
+        cols = ["why", "ltp", "pchg", "cum_vol", "avg_vol", "rvol", "vol_15m", "spike", "fast", "move_5m"]
         fmt = flagged[cols].copy()
         fmt["cum_vol"] = fmt["cum_vol"].map(lambda x: f"{x/1e5:.1f}L")
         fmt["avg_vol"] = fmt["avg_vol"].map(lambda x: f"{x/1e5:.1f}L")
         fmt["vol_15m"] = fmt["vol_15m"].map(lambda x: "-" if pd.isna(x) else f"{x/1e5:.1f}L")
         fmt["rvol"] = fmt["rvol"].map(lambda x: f"{x:.1f}x")
         fmt["spike"] = fmt["spike"].map(lambda x: "-" if pd.isna(x) else f"{x:.1f}x")
+        fmt["fast"] = fmt["fast"].map(lambda x: "-" if pd.isna(x) else f"{x:.0f}x")
+        fmt["move_5m"] = fmt["move_5m"].map(lambda x: "-" if pd.isna(x) else f"{x:+.1f}%")
         fmt["pchg"] = fmt["pchg"].map(lambda x: f"{x:+.2f}%")
-        fmt.columns = ["LTP", "Chg", "Vol today", "Avg day", "RVOL", "Vol 15m", "Spike"]
+        fmt.columns = ["Why", "LTP", "Chg", "Vol today", "Avg day", "RVOL", "Vol 15m", "Spike", "5m", "5m chg"]
         print(fmt.head(40).to_string())
         if len(flagged) > 40:
             print(f"  ... and {len(flagged) - 40} more (see {self.alerts_file})")
@@ -495,6 +535,8 @@ def main():
     p.add_argument("--rvol", type=float, default=3.0)
     p.add_argument("--spike", type=float, default=5.0)
     p.add_argument("--spike-rvol", type=float, default=1.5)
+    p.add_argument("--fast", type=float, default=8.0)
+    p.add_argument("--candle", type=float, default=1.0)
     p.add_argument("--min-move", type=float, default=0.0)
     p.add_argument("--lookback", type=int, default=20)
     p.add_argument("--once", action="store_true")
